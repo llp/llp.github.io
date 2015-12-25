@@ -177,15 +177,135 @@
 
     
     
+
+    
       
+
+  
+  
+
+  
+  
+  
+
+  <article class="post post-type-normal " itemscope itemtype="http://schema.org/Article">
+
+    
+      <header class="post-header">
+
+        
+        
+          <h1 class="post-title" itemprop="name headline">
+            
+            
+              
+                
+                <a class="post-title-link" href="/2015/12/25/RxJava操作符之Share-Publish-Refcount/" itemprop="url">
+                  未命名
+                </a>
+              
+            
+          </h1>
+        
+
+        <div class="post-meta">
+          <span class="post-time">
+            发表于
+            <time itemprop="dateCreated" datetime="2015-12-25T16:00:46+08:00" content="2015-12-25">
+              2015-12-25
+            </time>
+          </span>
+
+          
+
+          
+            
+          
+
+          
+
+        </div>
+      </header>
+    
+
+
+    <div class="post-body">
+
       
-        
-        
-        
       
 
       
-    
+        
+          <span itemprop="articleBody">
+            
+              <p>title: ‘RxJava操作符之Share, Publish, Refcount’<br>date: 2015-12-25 15:47:04<br>tags:RxJava</p>
+<p><a href="http://nerds.weddingpartyapp.com/tech/2015/01/21/rxjava-share-publish-refcount-and-all-that-jazz/" target="_blank" rel="external">原文链接</a></p>
+<p>看源码知道.share()操作符是.publish().refcount()调用链的包装。</p>
+<p>先来看ConnectedObservable</p>
+<pre><code>“ConnectedObservable” – This is a kind of observable which doesn’t emit items even if subscribed to.
+It only starts emitting items after its .connect() method is called.
+</code></pre><p>因为这个原因，在ConnectedObservable的connect这个方法被调用之前，connected obesrvable也被认为是“冷”和不活跃。</p>
+<p>再看publish方法</p>
+<pre><code>.publish()– This method allows us to change an ordinary observable into a “ConnectedObservable”.
+Simply call this method on an ordinary observable and it becomes a connected one.
+</code></pre><p>现在我们知道了share操作符的1/2,那么为什么需要运用Connected Observable这个操作符呢？文档上是这么写的：</p>
+<pre><code>In this way you can wait for all intended Subscribers to subscribe to the Observable before the Observable begins emitting items.
+</code></pre><p>这就意味着publish可以调用多个subscriber。当你有超过一个订阅者的时候，处理每个订阅和正确的销毁他们变得棘手。<br>为了使这个更方便，Rx发明了这个魔法操作符refcount():</p>
+<pre><code>refcount() – This operator keeps track of how many subscribers are subscribed to the resulting Observable and
+refrains from disconnecting from the source ConnectedObservable until all such Observables are unsubscribed.
+</code></pre><p>refcount本质上在后台维护着一个引用计数器，当一个subscription需要取消订阅或者销毁的时候，发出一个正确的动作。</p>
+<p>我们再次看一下debouncedBuffer的例子，看一下在哪，share是怎么用的。</p>
+<pre><code>Observable&lt;Object&gt; tapEventEmitter = _rxBus.toObserverable().share();
+// which is really the same as:
+Observable&lt;Object&gt; tapEventEmitter = _rxBus.toObserverable().publish().refcount();
+</code></pre><p>我们现在有了一个”shareable”的名字叫”tapEventEmitter”的observable。<br>因为他是可以分享的，而且还不是“live”(share操作符中的publish调用使其变成一个ConnectedObservable)，<br>我们可以用他构成我们的Observables，而且要确保我们有了一个原始的observable的引用<br>（这个例子中原始的observable是_rxBus.toObserverable()）.</p>
+<pre><code>Observable&lt;Object&gt; tapEventEmitter = _rxBus.toObserverable().share();
+Observable&lt;Object&gt; debouncedEventEmitter = tapEventEmitter.debounce(1, TimeUnit.SECONDS);
+tapEventEmitter.buffer(debouncedEventEmitter)
+//...
+</code></pre><p>所有的这一切看起来都很好。然而这个实现会有一个可能的竞争条件。因为这有两个subscribers(debounce and buffer)而且会在不同的时间点发生,所以竞争条件就会发生。<br>记住RxBus是由hot/live Subject支持的不断的发射数据。通过使用share操作符，我们保证引用的是同一个资源。<br>而不是subscribers在不同的时间点订阅，他们会收到准确的相同的数据。</p>
+<pre><code>The race condition is when the two consumers subscribe. Often on a hot stream it doesn’t matter when subscribers come and go,and refCount is perfect for that.
+The race condition refCount protects against is having only 1 active subscription upstream. However,if 2 Subscribers subscribe to a refcounted stream that emits 1, 2, 3, 4, 5, the first may get 1, 2, 3, 4, 5 and the second may get 2, 3, 4, 5.
+
+To ensure all subscribers start at exactly the same time and get the exact same values, refCount can not be used.
+Either ConnectableObservable with a manual, imperative invocation of connect needs to be done, or the variant of publish(function)which connects everything within the function before connecting the upstream.
+</code></pre><p>在我们的用法中几乎立即执行所以没有什么关系。但是我们原始的意图是把debouncedBuffer方法作为一个单独的操作符。<br>如果相同的事件没有被发射出去，从概念上看起来是不正确的。</p>
+<p>通过Bean后来的建议，我添加了一个更好的第三方的实现，用来处理这种竞争条件。</p>
+<pre><code>// don&apos;t start emitting items just yet by turning the observable to a connected one
+ConnectableObservable&lt;Object&gt; tapEventEmitter = _rxBus.toObserverable().publish();
+
+tapEventEmitter.publish((Func1) (stream) -&gt; {
+
+// inside `publish`, &quot;stream&quot; is truly multicasted
+
+// applying the same technique for getting a debounced buffer sequence
+       return stream.buffer(stream.debounce(1, TimeUnit.SECONDS));
+
+}).subscribe((Action1) (taps) {
+_showTapCount(taps.size());
+});
+
+// start listening to events now
+tapEventEmitter.connect();
+</code></pre>
+            
+          </span>
+        
+      
+    </div>
+
+    <footer class="post-footer">
+      
+
+      
+
+      
+      
+        <div class="post-eof"></div>
+      
+    </footer>
+  </article>
+
 
     
       
@@ -319,7 +439,7 @@
         <nav class="site-state motion-element">
           <div class="site-state-item site-state-posts">
             <a href="/archives">
-              <span class="site-state-item-count">1</span>
+              <span class="site-state-item-count">2</span>
               <span class="site-state-item-name">日志</span>
             </a>
           </div>
